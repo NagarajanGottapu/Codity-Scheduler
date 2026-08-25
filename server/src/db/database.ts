@@ -1,145 +1,34 @@
+import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import fs from 'node:fs';
 
-// Universal SQLite Driver (node:sqlite -> better-sqlite3)
-interface SQLiteAdapter {
-  queryAll<T = any>(sql: string, params?: any[]): T[];
-  queryOne<T = any>(sql: string, params?: any[]): T | null;
-  run(sql: string, params?: any[]): { changes: number; lastInsertRowid: number | bigint };
-  exec(sql: string): void;
-  transaction<T>(fn: () => T): T;
-}
-
-let createAdapter: (finalPath: string, inMemory: boolean) => SQLiteAdapter;
-
-try {
-  // Tier 1: Native Node.js 22+ DatabaseSync
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const nodeSqlite = require('node:sqlite');
-  createAdapter = (finalPath: string, inMemory: boolean) => {
-    const rawDb = new nodeSqlite.DatabaseSync(inMemory ? ':memory:' : finalPath);
-    try {
-      rawDb.exec(`
-        PRAGMA foreign_keys = ON;
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA busy_timeout = 10000;
-      `);
-    } catch (e) {}
-
-    let txDepth = 0;
-    return {
-      queryAll<T = any>(sql: string, params: any[] = []): T[] {
-        const stmt = rawDb.prepare(sql);
-        return stmt.all(...params) as T[];
-      },
-      queryOne<T = any>(sql: string, params: any[] = []): T | null {
-        const stmt = rawDb.prepare(sql);
-        const row = stmt.get(...params);
-        return (row as T) || null;
-      },
-      run(sql: string, params: any[] = []): { changes: number; lastInsertRowid: number | bigint } {
-        const stmt = rawDb.prepare(sql);
-        const result = stmt.run(...params);
-        return {
-          changes: Number(result.changes),
-          lastInsertRowid: result.lastInsertRowid
-        };
-      },
-      exec(sql: string): void {
-        rawDb.exec(sql);
-      },
-      transaction<T>(fn: () => T): T {
-        if (txDepth > 0) return fn();
-        txDepth++;
-        try {
-          rawDb.exec('BEGIN IMMEDIATE');
-          const res = fn();
-          rawDb.exec('COMMIT');
-          return res;
-        } catch (err) {
-          try {
-            rawDb.exec('ROLLBACK');
-          } catch (rErr) {}
-          throw err;
-        } finally {
-          txDepth--;
-        }
-      }
-    };
-  };
-} catch (e1) {
-  // Tier 2: better-sqlite3 for Node 18/20
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const BetterSqlite = require('better-sqlite3');
-  createAdapter = (finalPath: string, inMemory: boolean) => {
-    const rawDb = new BetterSqlite(inMemory ? ':memory:' : finalPath);
-    try {
-      rawDb.pragma('foreign_keys = ON');
-      rawDb.pragma('journal_mode = WAL');
-      rawDb.pragma('synchronous = NORMAL');
-      rawDb.pragma('busy_timeout = 10000');
-    } catch (e) {}
-
-    let txDepth = 0;
-    return {
-      queryAll<T = any>(sql: string, params: any[] = []): T[] {
-        const stmt = rawDb.prepare(sql);
-        return stmt.all(...params) as T[];
-      },
-      queryOne<T = any>(sql: string, params: any[] = []): T | null {
-        const stmt = rawDb.prepare(sql);
-        const row = stmt.get(...params);
-        return (row as T) || null;
-      },
-      run(sql: string, params: any[] = []): { changes: number; lastInsertRowid: number | bigint } {
-        const stmt = rawDb.prepare(sql);
-        const result = stmt.run(...params);
-        return {
-          changes: Number(result.changes),
-          lastInsertRowid: result.lastInsertRowid
-        };
-      },
-      exec(sql: string): void {
-        rawDb.exec(sql);
-      },
-      transaction<T>(fn: () => T): T {
-        if (txDepth > 0) return fn();
-        txDepth++;
-        try {
-          rawDb.exec('BEGIN IMMEDIATE');
-          const res = fn();
-          rawDb.exec('COMMIT');
-          return res;
-        } catch (err) {
-          try {
-            rawDb.exec('ROLLBACK');
-          } catch (rErr) {}
-          throw err;
-        } finally {
-          txDepth--;
-        }
-      }
-    };
-  };
-}
-
 export class DatabaseManager {
   private static instance: DatabaseManager;
-  private adapter: SQLiteAdapter;
+  private db: DatabaseSync;
   private inMemory: boolean;
+  private transactionDepth = 0;
 
   private constructor(dbPath?: string) {
     this.inMemory = dbPath === ':memory:';
-    const dataDir = path.resolve(process.cwd(), 'data');
-    if (!fs.existsSync(dataDir)) {
-      try {
-        fs.mkdirSync(dataDir, { recursive: true });
-      } catch (e) {}
-    }
-    const finalPath = dbPath || path.join(dataDir, 'scheduler.db');
 
-    this.adapter = createAdapter(finalPath, this.inMemory);
+    if (!this.inMemory) {
+      try {
+        const dataDir = path.resolve(process.cwd(), 'data');
+        if (!fs.existsSync(dataDir)) {
+          fs.mkdirSync(dataDir, { recursive: true });
+        }
+        const finalPath = dbPath || path.join(dataDir, 'scheduler.db');
+        this.db = new DatabaseSync(finalPath);
+      } catch (err) {
+        console.warn('⚠️ Could not open disk database, falling back to memory database:', err);
+        this.inMemory = true;
+        this.db = new DatabaseSync(':memory:');
+      }
+    } else {
+      this.db = new DatabaseSync(':memory:');
+    }
+
+    this.configurePragmas();
     this.initializeSchema();
   }
 
@@ -152,6 +41,23 @@ export class DatabaseManager {
 
   public static createIsolated(dbPath = ':memory:'): DatabaseManager {
     return new DatabaseManager(dbPath);
+  }
+
+  public getRawDb(): DatabaseSync {
+    return this.db;
+  }
+
+  private configurePragmas(): void {
+    try {
+      this.db.exec(`
+        PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA busy_timeout = 10000;
+      `);
+    } catch (e) {
+      // WAL mode fallback
+    }
   }
 
   private initializeSchema(): void {
@@ -174,10 +80,10 @@ export class DatabaseManager {
     }
 
     if (schemaSql) {
-      this.adapter.exec(schemaSql);
+      this.db.exec(schemaSql);
     } else {
       console.warn('⚠️ schema.sql not found on disk, initializing core tables via fallback DDL');
-      this.adapter.exec(`
+      this.db.exec(`
         PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS organizations (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT UNIQUE NOT NULL, plan TEXT NOT NULL DEFAULT 'enterprise', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin', 'developer', 'viewer')), api_key TEXT UNIQUE NOT NULL, is_active INTEGER NOT NULL DEFAULT 1, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE);
@@ -200,23 +106,50 @@ export class DatabaseManager {
   }
 
   public queryAll<T = any>(sql: string, params: any[] = []): T[] {
-    return this.adapter.queryAll<T>(sql, params);
+    const stmt = this.db.prepare(sql);
+    return stmt.all(...params) as T[];
   }
 
   public queryOne<T = any>(sql: string, params: any[] = []): T | null {
-    return this.adapter.queryOne<T>(sql, params);
+    const stmt = this.db.prepare(sql);
+    const row = stmt.get(...params);
+    return (row as T) || null;
   }
 
   public run(sql: string, params: any[] = []): { changes: number; lastInsertRowid: number | bigint } {
-    return this.adapter.run(sql, params);
+    const stmt = this.db.prepare(sql);
+    const result = stmt.run(...params);
+    return {
+      changes: Number(result.changes),
+      lastInsertRowid: result.lastInsertRowid
+    };
   }
 
   public exec(sql: string): void {
-    this.adapter.exec(sql);
+    this.db.exec(sql);
   }
 
   public transaction<T>(fn: () => T): T {
-    return this.adapter.transaction<T>(fn);
+    if (this.transactionDepth > 0) {
+      return fn();
+    }
+
+    this.transactionDepth++;
+    try {
+      this.db.exec('BEGIN IMMEDIATE');
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch (rollbackErr) {
+        // Rollback error ignore
+      }
+      throw error;
+    } finally {
+      this.transactionDepth--;
+    }
   }
 }
 
